@@ -11,6 +11,14 @@ import pyklip.klip as klip
 import pyklip.instruments.MagAO as MagAO
 import pyklip.parallelized as parallelized
 import pyklip.fakes as fakes
+import panel as pn
+from panel.interact import interact
+pn.extension()
+import hvplot.pandas
+import holoviews as hv
+from bokeh.models import HoverTool
+from holoviews import opts
+hv.extension('bokeh')
     
 
 @attr.s(auto_attribs=True)
@@ -94,7 +102,8 @@ class PECollapser:
 
         # Find peak SNR best parameters
         collapsed_peaksnr = data[0][0]
-        peaksnr_kl, peaksnr_ann, peaksnr_move = np.where(collapsed_peaksnr == np.nanmax(collapsed_peaksnr))
+        collapsed_peaksnr_norm = collapsed_peaksnr / np.nanmax(collapsed_peaksnr)
+        peaksnr_kl, peaksnr_ann, peaksnr_move = np.where(collapsed_peaksnr_norm == np.nanmax(collapsed_peaksnr_norm))
         return peaksnr_ann[0] + 1, peaksnr_move[0], peaksnr_kl[0] # Add one to annuli to make up for python indexing
 
     def collapse_avgsnr(self, data):
@@ -110,7 +119,8 @@ class PECollapser:
         
         # Find avg SNR best parameters
         collapsed_avgsnr = data[2][0]
-        avgsnr_kl, avgsnr_ann, avgsnr_move = np.where(collapsed_avgsnr == np.nanmax(collapsed_avgsnr))
+        collapsed_avgsnr_norm = collapsed_avgsnr / np.nanmax(collapsed_avgsnr)
+        avgsnr_kl, avgsnr_ann, avgsnr_move = np.where(collapsed_avgsnr_norm == np.nanmax(collapsed_avgsnr_norm))
         return avgsnr_ann[0] + 1, avgsnr_move[0], avgsnr_kl[0] # Add one to annuli to make up for python indexing
 
     def collapse_contrast(self, data):
@@ -156,7 +166,12 @@ class PECollapser:
         peaksnr_only = data[0][0] # Peak SNR
         avgsnr_only = data[2][0] # Avg SNR
 
-        collapsed_contrast = -1*data[-1][0] # Contrast
+        # Normalize
+        peaksnr_only_norm = peaksnr_only / np.nanmax(peaksnr_only)
+        avgsnr_only_norm = avgsnr_only / np.nanmax(avgsnr_only)
+
+        # Contrast
+        collapsed_contrast = -1*data[-1][0] 
         log_contrast = np.log10(collapsed_contrast)
 
         # Filter unphysical contrasts
@@ -169,70 +184,129 @@ class PECollapser:
         abs_log_contrast_sub = abs_log_contrast - np.nanmin(abs_log_contrast)
 
         # Divide by the max so values go from 0-->1
-        contrast_only = abs_log_contrast_sub / (np.nanmax(abs_log_contrast) - np.nanmin(abs_log_contrast))
+        contrast_only_norm = abs_log_contrast_sub / (np.nanmax(abs_log_contrast) - np.nanmin(abs_log_contrast))
 
-        collapsed_all = np.sum([peaksnr_only, avgsnr_only, contrast_only], axis = 0)
+        collapsed_all = np.sum([peaksnr_only_norm, avgsnr_only_norm, contrast_only_norm], axis = 0)
 
         all_kl, all_ann, all_move = np.where(collapsed_all == np.nanmax(collapsed_all))
 
         return all_ann[0] + 1, all_move[0], all_kl[0]
 
+    def _plot_snrmap(self, snrmap):
+        """Make interactive snr map with sliding kl widget"""
 
-    def analyze(self, datadir, annuli, movement):
+        def get_image(frame):
+            """Create snrmap image and frame sliding function"""
+            snrmap_snr = snrmap[0]
+            im = hv.Image(data=snrmap_snr[frame], bounds = (0,0,len(snrmap_snr[1]),len(snrmap_snr[2])))
+            tooltips = [("X", "$x"), ("Y", "$y"), ("SNR", "@image")] # Adds hover names and axes
+            hover = HoverTool(tooltips=tooltips)
+            return im.opts(xlim=(200, 250), 
+                ylim=(200, 250), 
+                cmap="magma",
+                clim=(0, 5),
+                xaxis=None,
+                yaxis=None,
+                tools=[hover],
+            )
+
+        # Add frame slider widget
+        frame_slider = pn.widgets.DiscreteSlider(
+        value=0,
+        options={1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 10: 5, 25: 6, 50: 7, 100: 8},
+        name="KL",
+        )
+
+        # Show plot with panel
+        @pn.depends(frame=frame_slider)
+        def image(frame):
+            return get_image(frame)
+        img_dmap = hv.DynamicMap(image)
+
+        # Find planet location and draw circle
+        dy =  self.ra*np.sin((np.radians(self.pa+90)))
+        dx =  self.ra*np.cos((np.radians(self.pa+90)))
+        center = int(len(snrmap[0][1])/2)
+        x = center + dx
+        y = center + dy
+        ellipse = hv.Ellipse(x,y,4)
+
+        return pn.Row(img_dmap * ellipse, pn.Column(frame_slider))
+
+
+    def klip_analyze(self, datadir, annuli, movement, outputdir):
         """
         Runs KLIP and measures planet SNR given a set of data, parameter combinations, and other KLIP-relevant parameters.
         
         Args:
             datadir (str): Directory containing your data
-            ra (list:int): The separation/s (in pixels) of your planet/s from its/their host star
-            pa (list:int): The position angle/s (in degrees) of your planet/s from its/their host star
             annuli (int): Annuli value to be tested
             movement (int): Movement value to be tested
-            highpass (int): Desired highpass value in pixels (FWHM is recommended)
-            iwa (int): Desired inner working angle for KLIP (0 is default)
             outputdir (str): Output directory for KLIP-ed data
-            dataname (str): prefix for name of output dataset (ends with '-KLmodes-all.fits')
+            
         """
 
-        mask = (self.ra, self.pa, wid)
-        filelist = glob.glob(datadir)
+        # Make mask of width 'wid' to cover planets when making snr measurements
+        wid = [5,10]
+        mask = ([self.ra], [self.pa], wid)
 
+        # Get data and set params
+        filelist = glob.glob(datadir)
         dataset = MagAO.MagAOData(filelist, highpass=False) 
         dataset.IWA = self.hp * 2
         prefix = f'{self.dataname}_{annuli}_{movement}'
-        parallelized.klip_dataset(dataset, outputdir=outputdir, fileprefix=prefix, algo='klip', annuli=annuli, subsections=1, movement=movement,
-        numbasis=[1,2,3,4,5,10,20,50,100], calibrate_flux=False, mode="ADI", highpass=highpass, save_aligned=False, time_collapse='median', maxnumbasis=100, verbose = False)
 
+        # Run KLIP
+        parallelized.klip_dataset(dataset, outputdir=outputdir, fileprefix=prefix, algo='klip', annuli=annuli, subsections=1, movement=movement,
+        numbasis=[1,2,3,4,5,10,20,50,100], calibrate_flux=False, mode="ADI", highpass=self.hp, save_aligned=False, time_collapse='median', maxnumbasis=100, verbose = False)
+
+        # Get klipped data
         klipped = np.nanmean(dataset.output[:,:,0,:,:], axis = 1)
 
-        snrmaps, peaksnr, snrsums, snrspurious = snr.create_map(klipped, fwhm = 8, smooth=1, planets=mask, saveOutput=False, sigma = 3, checkmask=False, verbose = True, outputName = 'Test')
+        # Make SNR map
+        snrmaps, peaksnr, snrsums, snrspurious = snr.create_map(klipped, fwhm = 8, smooth=1, planets=mask, saveOutput=False, sigma = 3, checkmask=False, verbose = True, outputName=f"{self.dataname}_{annuli}_{movement}_KLModes-all_allsnrmap")
+       
 
+        return  self._plot_snrmap(snrmaps)
 
+    def analyze_all(self, datadir, outputdir):
+        """Analyze all output best parameters from collapser
+        
+        Perform a KLIP reduction and create an snrmap using the parameters given as best by the collapser tool
+        
+        Args:
+            datadir (str): Location of data files to be klipped in the form "data/*fits"
+            outputdir (str): Location to put output klipped file and snr map e.g. "output/"
 
+        Returns:
+            interactive plot of snrmaps
+        
+        """
+        
+        # Peak SNR
+        map1 = self.klip_analyze(datadir, annuli = self.peaksnr_ann, movement = self.peaksnr_move, outputdir = outputdir)
+        
+        # Avg SNR
+        map2 = self.klip_analyze(datadir, annuli = self.avgsnr_ann, movement = self.avgsnr_move, outputdir = outputdir)
+        
+        map3 = self.klip_analyze(datadir, annuli = self.contrast_ann, movement = self.contrast_move, outputdir = outputdir)
 
-
-
-
-def measure_snr(x):
-    
-    """
-    Measures planet SNR given a set of data
-    
-    Args:
-        data (str): Directory containing your data
-        ra (list:int): The separation/s (in pixels) of your planet/s from its/their host star
-        pa (list:int): The position angle/s (in degrees) of your planet/s from its/their host star
-    """
-    
-    datadir = x[0] 
-    ra = x[1]
-    pa = x[2] 
-    wid = [5,20]
-    smooth = 1
-    
-    mask = (ra, pa, wid)
-    snrmaps, peaksnr, snrsums, snrspurious = snr.create_map(datadir, fwhm = 8, smooth=smooth, planets=mask, saveOutput=True, sigma = 3, checkmask=False, verbose = False)
 
         
-    return peaksnr[0]
+
+        return map1 + map2 + map3
+        
+        
+        
+
+
+
+
+
+
+
+
+
+
+
 
