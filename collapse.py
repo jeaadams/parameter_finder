@@ -32,7 +32,10 @@ class PECollapser:
     """Position angle of planet in degrees e.g. [170]"""
 
     hp: float
-    """Highpass filter size for KLIP reductions in pixelg e.g. 2"""
+    """Highpass filter size for KLIP reductions in pixels (usually set to 1/2 FWHM)"""
+
+    iwa: float
+    """ IWA for KLIP reductions (usually set to FWHM)"""
 
     def collapse_across_planets(self) -> dict:
         """Collapse parameter explorer across the planet dimension 
@@ -46,11 +49,11 @@ class PECollapser:
         # Load fits file
         data = fits.getdata(self.pepath)
 
-        # Collapse across planet dimension, penalize Nans, reduce to only kl, movement, annuli dimensions
+        # Collapse across planet dimesnion (reduce to only kl, movement, annuli dimensions)
         if self.handle_planets == 'mean':
-            collapsed = np.mean(data, axis = 3)
+            collapsed = np.nanmean(data, axis = 3)
         elif self.handle_planets == 'median':
-            collapsed = np.median(data, axis = 3)
+            collapsed = np.nanmedian(data, axis = 3)
 
         # Find best parameters across all metrics
         self.peaksnr_ann, self.peaksnr_move, self.peaksnr_kl = self.collapse_peaksnr(collapsed)
@@ -62,6 +65,7 @@ class PECollapser:
                     "RA": self.ra,
                     "PA": self.pa,
                     "highpass": self.hp,
+                    "IWA": self.iwa,
                     "PeakSNR_annuli" : self.peaksnr_ann, 
                     "PeakSNR_movement": self.peaksnr_move, 
                     "PeakSNR_kl" : self.peaksnr_kl,
